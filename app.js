@@ -3,20 +3,107 @@ const $=id=>document.getElementById(id);
 let config={...defaults}, key='', refs=[], batches=[], selected='', active=null, submitting=false, directory=null, previewItem=null, db=null;
 const urls=new Map();
 const states={queued:'等待生成',running:'正在生成',done:'已完成',error:'生成失败',stopped:'已停止'};
+let restoringDraft=true, draftDBPromise=null, draftWrites=0, draftTextError=false, draftRefsError=false;
+const draftFields=['prompt','size','quality','count','concurrency'];
+function draftStatus(){
+  const failed=draftTextError||draftRefsError;
+  $('draftStatus').dataset.error=String(failed);
+  $('draftStatus').textContent=failed?'草稿未完整保存，请检查浏览器存储':draftWrites?'正在保存参考图片…':'草稿已保存到此浏览器';
+}
+function saveDraftText(){
+  if(restoringDraft)return;
+  try{
+    // Synchronous, small writes keep even the last keystroke across a quick refresh.
+    localStorage.setItem('shiguang.draft',JSON.stringify(Object.fromEntries(draftFields.map(id=>[id,$(id).value]))));
+    draftTextError=false;
+  }catch{draftTextError=true;}
+  draftStatus();
+}
+function draftDB(){
+  if(!draftDBPromise)draftDBPromise=new Promise((resolve,reject)=>{
+    const request=indexedDB.open('shiguang-drafts',1);
+    request.onupgradeneeded=()=>request.result.createObjectStore('draft');
+    request.onsuccess=()=>resolve(request.result);
+    request.onerror=()=>reject(request.error);
+  });
+  return draftDBPromise;
+}
+async function saveDraftReferences(){
+  if(restoringDraft)return;
+  const snapshot=refs.map(({name,blob,role})=>({name,blob,role}));
+  draftWrites++;draftStatus();
+  try{
+    const connection=await draftDB();
+    await new Promise((resolve,reject)=>{
+      const tx=connection.transaction('draft','readwrite');
+      tx.objectStore('draft').put(snapshot,'references');
+      tx.oncomplete=resolve;tx.onabort=()=>reject(tx.error);tx.onerror=()=>reject(tx.error);
+    });
+    draftRefsError=false;
+  }catch{draftRefsError=true;}
+  finally{draftWrites--;draftStatus();}
+}
+async function restoreDraft(){
+  try{
+    const draft=JSON.parse(localStorage.getItem('shiguang.draft')||'null');
+    if(draft && typeof draft==='object'){
+      if(typeof draft.prompt==='string')$('prompt').value=draft.prompt.slice(0,32000);
+      if(typeof draft.size==='string' && draft.size)$('size').value=draft.size;
+      if(['high','medium','low','auto'].includes(draft.quality))$('quality').value=draft.quality;
+      for(const [id,max]of [['count',20],['concurrency',6]]){
+        const n=Number(draft[id]);if(Number.isInteger(n)&&n>=1&&n<=max)$(id).value=n;
+      }
+    }
+  }catch{draftTextError=true;}
+  try{
+    const connection=await draftDB();
+    const saved=await new Promise((resolve,reject)=>{
+      const request=connection.transaction('draft').objectStore('draft').get('references');
+      request.onsuccess=()=>resolve(request.result);request.onerror=()=>reject(request.error);
+    });
+    if(Array.isArray(saved))refs=saved.filter(r=>r && r.blob instanceof Blob).slice(0,16).map(r=>({name:typeof r.name==='string'?r.name:'reference.png',blob:r.blob,role:['free','subject','background','style'].includes(r.role)?r.role:'free'}));
+  }catch{draftRefsError=true;}
+  updatePrompt();renderRefs();markRatio();$('countBadge').textContent=$('count').value+' 张';
+  restoringDraft=false;$('composerFields').disabled=false;draftStatus();
+}
+$('clearDraft').onclick=()=>{
+  $('prompt').value='';refs=[];$('size').value='2048x1152';$('quality').value='high';$('count').value='1';$('concurrency').value='1';
+  updatePrompt();markRatio();$('countBadge').textContent='1 张';saveDraftText();renderRefs();
+  toast('已清空创作草稿，生成历史仍然保留');
+};
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='hidden')saveDraftText();});
+window.addEventListener('pagehide',saveDraftText);
 function toast(message){const el=document.createElement('div');el.className='toast';el.textContent=message;$('toasts').append(el);setTimeout(()=>el.remove(),6500);}
 function element(tag,cls,text){const el=document.createElement(tag);if(cls)el.className=cls;if(text!==undefined)el.textContent=text;return el;}
 function urlFor(blob){if(!urls.has(blob))urls.set(blob,URL.createObjectURL(blob));return urls.get(blob);}
-function readConfig(){try{config={...defaults,...JSON.parse(localStorage.getItem('shiguang.config')||'{}')};}catch{config={...defaults};}for(const k of Object.keys(defaults)){if($(k))$(k).value=k==='extra'?JSON.stringify(config[k],null,2):config[k];}$('modelLabel').textContent=config.model;}
+let rememberKey=false;
+function readConfig(){try{config={...defaults,...JSON.parse(localStorage.getItem('shiguang.config')||'{}')};}catch{config={...defaults};}for(const k of Object.keys(defaults)){if($(k))$(k).value=k==='extra'?JSON.stringify(config[k],null,2):config[k];}$('modelLabel').textContent=config.model;try{key=localStorage.getItem('shiguang.apiKey')||'';rememberKey=Boolean(key);}catch{}$('rememberKey').checked=rememberKey;$('settingsOpen').classList.toggle('connected',Boolean(key));}
 function settingsConfig(){const result={};for(const k of Object.keys(defaults))result[k]=$(k).value.trim();result.timeout=Number(result.timeout);result.pollSeconds=Number(result.pollSeconds);result.extra=JSON.parse(result.extra||'{}');if(!result.extra||Array.isArray(result.extra)||typeof result.extra!=='object')throw new Error('额外参数必须是 JSON 对象。');for(const p of [result.generationPath,result.editPath,result.taskPath])endpoint(result,p);return result;}
-function openSettings(){$('apiKey').value=key;$('settings').showModal();}
+function openSettings(){$('apiKey').value=key;$('rememberKey').checked=rememberKey;$('settings').showModal();}
 $('settingsOpen').onclick=openSettings;
 document.querySelectorAll('[data-close]').forEach(b=>b.onclick=()=>$(b.dataset.close).close());
-$('settingsForm').onsubmit=e=>{e.preventDefault();try{config=settingsConfig();key=$('apiKey').value.trim();localStorage.setItem('shiguang.config',JSON.stringify(config));$('modelLabel').textContent=config.model;$('settingsOpen').classList.toggle('connected',Boolean(key));$('settings').close();toast('设置已保存');}catch(e){toast(e.message);}};
+$('settingsForm').onsubmit=e=>{
+  e.preventDefault();
+  try {
+    const nextConfig=settingsConfig();
+    const nextKey=$('apiKey').value.trim();
+    const nextRemember=$('rememberKey').checked && Boolean(nextKey);
+    // Keep the optional credential outside settings/history/draft records.
+    if(nextRemember)localStorage.setItem('shiguang.apiKey',nextKey);
+    else localStorage.removeItem('shiguang.apiKey');
+    localStorage.setItem('shiguang.config',JSON.stringify(nextConfig));
+    config=nextConfig;key=nextKey;rememberKey=nextRemember;
+    $('rememberKey').checked=rememberKey;
+    $('modelLabel').textContent=config.model;
+    $('settingsOpen').classList.toggle('connected',Boolean(key));
+    $('settings').close();toast(rememberKey?'设置已保存，刷新后会记住 API Key':'设置已保存，API Key 仅本次使用');
+  }catch(e){toast(['QuotaExceededError','SecurityError'].includes(e.name)?'浏览器不允许保存设置，请检查存储权限或退出无痕模式。':e.message);}
+};
 $('testConnection').onclick=async()=>{try{const c=settingsConfig();$('connectionResult').textContent='正在检查浏览器跨域访问…';const r=await fetch(endpoint(c,c.generationPath),{method:'POST',credentials:'omit',headers:{Authorization:'Bearer cors-check-invalid-key','Content-Type':'application/json'},body:JSON.stringify({model:c.model,prompt:'connection-check'}),signal:AbortSignal.timeout(15000)});$('connectionResult').textContent=r.status===401||r.status===403?`跨域可访问（HTTP ${r.status}）。未使用真实密钥，不验证余额或模型。`:`接口响应 HTTP ${r.status}。此检查不验证模型和余额。`;}catch(e){$('connectionResult').textContent='浏览器无法读取响应，请检查网络或服务商跨域配置。';}};
 function openDB(){return new Promise((resolve,reject)=>{const req=indexedDB.open('shiguang-studio',1);req.onupgradeneeded=()=>req.result.createObjectStore('batches',{keyPath:'id'});req.onsuccess=()=>resolve(req.result);req.onerror=()=>reject(req.error);});}
 async function storeBatch(batch){if(!db)return;try{await new Promise((resolve,reject)=>{const tx=db.transaction('batches','readwrite');tx.objectStore('batches').put(batch);tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error);});}catch{toast('浏览器存储空间不足，请立即下载图片；当前页面仍可使用。');}}
 async function loadBatches(){db=await openDB();batches=await new Promise((resolve,reject)=>{const req=db.transaction('batches').objectStore('batches').getAll();req.onsuccess=()=>resolve(req.result);req.onerror=()=>reject(req.error);});batches.sort((a,b)=>b.created-a.created);for(const batch of batches){for(const item of batch.items)if(['queued','running'].includes(item.status)){item.status='stopped';item.error='页面已关闭或刷新；服务端可能仍在生成，确认后可手动重试。';}}}
-function renderRefs(){$('references').replaceChildren();refs.forEach((ref,i)=>{const card=element('div','reference');const img=element('img');img.src=urlFor(ref.blob);img.alt=`参考图 ${i+1}：${ref.name}`;img.onclick=()=>showPreview({blob:ref.blob,name:ref.name});card.append(img,element('span','index',i+1));const del=element('button','', '×');del.type='button';del.title='删除参考图片';del.onclick=()=>{refs.splice(i,1);renderRefs();};const role=element('select');role.setAttribute('aria-label',`参考图 ${i+1} 的角色`);for(const [v,t]of [['free','自由参考'],['subject','主体外观'],['background','背景'],['style','风格']]){const opt=element('option','',t);opt.value=v;role.append(opt);}role.value=ref.role;role.onchange=()=>{if(role.value==='background')for(const r of refs)if(r!==ref&&r.role==='background')r.role='free';ref.role=role.value;renderRefs();};card.append(del,role);$('references').append(card);});$('mode').textContent=refs.length?'图生图 · '+refs.length+' 张':'文生图';$('refHint').hidden=!refs.length;}
+function renderRefs(){$('references').replaceChildren();refs.forEach((ref,i)=>{const card=element('div','reference');const img=element('img');img.src=urlFor(ref.blob);img.alt=`参考图 ${i+1}：${ref.name}`;img.onclick=()=>showPreview({blob:ref.blob,name:ref.name});card.append(img,element('span','index',i+1));const del=element('button','', '×');del.type='button';del.title='删除参考图片';del.onclick=()=>{refs.splice(i,1);renderRefs();};const role=element('select');role.setAttribute('aria-label',`参考图 ${i+1} 的角色`);for(const [v,t]of [['free','自由参考'],['subject','主体外观'],['background','背景'],['style','风格']]){const opt=element('option','',t);opt.value=v;role.append(opt);}role.value=ref.role;role.onchange=()=>{if(role.value==='background')for(const r of refs)if(r!==ref&&r.role==='background')r.role='free';ref.role=role.value;renderRefs();};card.append(del,role);$('references').append(card);});$('mode').textContent=refs.length?'图生图 · '+refs.length+' 张':'文生图';$('refHint').hidden=!refs.length;saveDraftReferences();}
 async function addFiles(files){for(const f of files){if(!['image/png','image/jpeg','image/webp'].includes(f.type)){toast('支持 PNG、JPG 和 WebP 图片');continue;}if(refs.length>=16){toast('本页面每次最多添加 16 张参考图');break;}if(f.size>30*1024*1024){toast('单张参考图片请控制在 30 MB 内');continue;}try{const bmp=await createImageBitmap(f);bmp.close();refs.push({name:f.name||'pasted.png',blob:f,role:'free'});}catch{toast('这张图片无法读取');}}renderRefs();}
 $('fileInput').onchange=async e=>{await addFiles([...e.target.files]);e.target.value='';};
 $('dropzone').onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();$('fileInput').click();}};
@@ -25,11 +112,13 @@ $('dropzone').ondragleave=()=>$('dropzone').classList.remove('dragover');
 $('dropzone').ondrop=e=>{e.preventDefault();$('dropzone').classList.remove('dragover');addFiles([...e.dataTransfer.files]);};
 document.addEventListener('paste',e=>{if($('settings').open)return;const files=[...(e.clipboardData?.files||[])];if(files.length){e.preventDefault();addFiles(files);}});
 document.addEventListener('dragover',e=>{if(e.dataTransfer.types.includes('Files'))e.preventDefault();});document.addEventListener('drop',e=>{if(e.dataTransfer.files.length)e.preventDefault();});
-function updatePrompt(){$('promptCount').textContent=$('prompt').value.length+' 字';}$('prompt').oninput=updatePrompt;
-$('count').oninput=()=>$('countBadge').textContent=$('count').value+' 张';
-$('ratios').onclick=e=>{const b=e.target.closest('[data-size]');if(b){$('size').value=b.dataset.size;markRatio();}};
-function markRatio(){document.querySelectorAll('[data-size]').forEach(b=>{const selected=b.dataset.size===$('size').value;b.classList.toggle('selected',selected);b.setAttribute('aria-pressed',String(selected));});}$('size').oninput=markRatio;
-document.querySelectorAll('[data-idea]').forEach(b=>b.onclick=()=>{$('prompt').value=b.dataset.idea;updatePrompt();$('prompt').focus();});
+function updatePrompt(){$('promptCount').textContent=$('prompt').value.length+' 字';}$('prompt').oninput=()=>{updatePrompt();saveDraftText();};
+$('count').oninput=()=>{$('countBadge').textContent=$('count').value+' 张';saveDraftText();};
+$('ratios').onclick=e=>{const b=e.target.closest('[data-size]');if(b){$('size').value=b.dataset.size;markRatio();saveDraftText();}};
+function markRatio(){document.querySelectorAll('[data-size]').forEach(b=>{const selected=b.dataset.size===$('size').value;b.classList.toggle('selected',selected);b.setAttribute('aria-pressed',String(selected));});}$('size').oninput=()=>{markRatio();saveDraftText();};
+$('quality').onchange=saveDraftText;
+$('concurrency').oninput=saveDraftText;
+document.querySelectorAll('[data-idea]').forEach(b=>b.onclick=()=>{$('prompt').value=b.dataset.idea;updatePrompt();saveDraftText();$('prompt').focus();});
 document.addEventListener('keydown',e=>{if((e.ctrlKey||e.metaKey)&&e.key==='Enter'&&!$('settings').open&&!active){$('createForm').requestSubmit();}if($('preview').open){if(e.key==='ArrowLeft')movePreview(-1);if(e.key==='ArrowRight')movePreview(1);}});
 function effectivePrompt(prompt,inputs){const notes=[];inputs.forEach((ref,i)=>{if(ref.role==='background')notes.push(`第 ${i+1} 张为唯一背景参考，保持房间、家具布局、透视和光线；其他图片的背景不要混入。`);if(ref.role==='subject')notes.push(`第 ${i+1} 张仅用于主体外观与身份细节参考。`);if(ref.role==='style')notes.push(`第 ${i+1} 张仅用于风格参考。`);});return prompt+(notes.length?'\n\n参考图片分工：\n'+notes.join('\n'):'');}
 $('createForm').onsubmit=async e=>{e.preventDefault();if(active||submitting)return;if(!key){toast('先填写 API Key，就可以开始创作');openSettings();return;}const prompt=$('prompt').value.trim();if(!prompt)return;submitting=true;$('generate').disabled=true;const count=Number($('count').value);const batch={id:crypto.randomUUID(),created:Date.now(),prompt,refs:refs.map(r=>({...r})),config:structuredClone(config),size:$('size').value.trim(),quality:$('quality').value,concurrency:Number($('concurrency').value),items:Array.from({length:count},(_,i)=>({id:crypto.randomUUID(),number:i+1,status:'queued'}))};batch.effectivePrompt=effectivePrompt(prompt,batch.refs);batches.unshift(batch);selected=batch.id;await storeBatch(batch);submitting=false;runBatch(batch);};
@@ -54,4 +143,7 @@ $('pickDir').onclick=async()=>{if(!window.showDirectoryPicker){toast('此浏览�
 async function saveToDirectory(item){try{const handle=await directory.getFileHandle(item.name,{create:true});const w=await handle.createWritable();await w.write(item.blob);await w.close();}catch{throw new Error('图片已生成，但目录写入失败，请用下载按钮保存。');}}
 $('exportAll').onclick=async()=>{const items=visibleItems().map(e=>e.item).filter(i=>i.blob);if(!items.length)return;if(directory){for(const i of items)try{await saveToDirectory(i);}catch(e){toast(e.message);return;}toast(`已保存 ${items.length} 张到 ${directory.name}`);}else{for(const i of items){download(i);await new Promise(r=>setTimeout(r,250));}toast('已请求下载。若未全部下载，请允许此网站下载多个文件。');}};
 window.addEventListener('beforeunload',e=>{if(active){e.preventDefault();e.returnValue='';}});
-readConfig();try{await loadBatches();}catch{toast('当前浏览器无法保存历史，建议下载生成结果。');}render();
+readConfig();
+const historyReady=loadBatches().catch(()=>toast('当前浏览器无法保存历史，建议下载生成结果。'));
+await restoreDraft();
+await historyReady;render();
