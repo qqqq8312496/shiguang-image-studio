@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f8f7f4"><meta name="referrer" content="no-referrer">
+  <title>拾光 · Image Studio</title><link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 80 80'%3E%3Crect width='80' height='80' rx='24' fill='%236e59d9'/%3E%3Cpath d='M40 12L47 33L68 40L47 47L40 68L33 47L12 40L33 33Z' fill='white'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar"><a class="brand" href="./"><span class="brand-icon">✦</span><span>拾光<small>IMAGE STUDIO</small></span></a><div class="header-note">让想象，有迹可循。</div><button id="settingsOpen" class="button secondary"><span class="status-dot"></span> API 设置 <span class="gear">⚙</span></button></header>
+<main class="workspace">
+  <aside class="creator">
+    <div class="section-heading"><div><span class="eyebrow">YOUR CREATIVE SPACE</span><h1>开始一次想象</h1></div><span id="mode" class="badge">文生图</span></div>
+    <form id="createForm">
+      <label class="field-label" for="prompt">画面描述 <span>尽管自由一点</span></label>
+      <div class="prompt-box"><textarea id="prompt" placeholder="想象一个画面……&#10;例如：我家的柯基正认真地写贺卡，真实又可爱。" required maxlength="32000"></textarea><div class="prompt-footer"><span>⌘ / Ctrl + Enter 生成</span><span id="promptCount">0 字</span></div></div>
+      <div class="field-label reference-label">参考图片 <span>添加后自动切换图生图</span></div>
+      <div id="references" class="references"></div>
+      <label id="dropzone" class="dropzone" tabindex="0" role="button" aria-label="添加参考图片"><input id="fileInput" type="file" accept="image/png,image/jpeg,image/webp" multiple hidden><span class="upload-icon">＋</span><strong>拖入图片，或点击上传</strong><small>支持多图 · 也可以直接粘贴图片</small></label>
+      <p id="refHint" class="helper" hidden>按顺序发送原图。可以为图片指定背景或主体角色。</p>
+      <div class="divider"></div>
+      <div class="field-label">创作参数 <span id="modelLabel">gpt-image-2.5</span></div>
+      <label class="sub-label" id="ratioLabel">画面比例</label>
+      <div class="ratio-options" id="ratios" role="group" aria-labelledby="ratioLabel">
+        <button type="button" class="selected" data-size="2048x1152" aria-pressed="true" title="2048 × 1152"><i class="ratio-wide" aria-hidden="true"></i>16:9</button>
+        <button type="button" data-size="2048x2048" aria-pressed="false" title="2048 × 2048"><i class="ratio-square" aria-hidden="true"></i>1:1</button>
+        <button type="button" data-size="1728x2304" aria-pressed="false" title="1728 × 2304"><i class="ratio-three-four" aria-hidden="true"></i>3:4</button>
+        <button type="button" data-size="1360x2048" aria-pressed="false" title="1360 × 2048"><i class="ratio-portrait" aria-hidden="true"></i>2:3</button>
+        <button type="button" data-size="1152x2048" aria-pressed="false" title="1152 × 2048"><i class="ratio-tall" aria-hidden="true"></i>9:16</button>
+        <button type="button" data-size="2048x1360" aria-pressed="false" title="2048 × 1360"><i class="ratio-landscape" aria-hidden="true"></i>3:2</button>
+      </div>
+      <div class="form-grid"><label>尺寸<input id="size" value="2048x1152" placeholder="2048x1152" required></label><label>质量<select id="quality"><option value="high" selected>高质量</option><option value="medium">中等质量</option><option value="low">低质量</option><option value="auto">自动</option></select></label><label>生成数量<input id="count" type="number" min="1" max="20" value="1" required></label><label>同时生成<input id="concurrency" type="number" min="1" max="6" value="1" required></label></div>
+      <button type="submit" id="generate" class="button primary generate"><span>✦</span> 开始生成 <span id="countBadge">1 张</span></button>
+      <p class="footnote">使用你自己的 API · 按服务商规则计费</p>
+    </form>
+  </aside>
+  <section class="results">
+    <div class="gallery-top"><div><span class="eyebrow">MADE OF IMAGINATION</span><h2>你的灵感画廊<span id="total">0</span></h2></div><div class="gallery-actions"><button id="pickDir" class="button secondary">选择保存目录</button><button id="exportAll" class="button secondary">下载本组</button></div></div>
+    <div class="batch-toolbar"><select id="batchSelect" aria-label="选择历史批次"><option value="">所有创作</option></select><div><button id="reuse" class="text-button">复用本组</button><button id="stop" class="text-button danger" hidden>停止等待</button></div></div>
+    <div id="saveDirInfo" class="save-dir" hidden></div>
+    <div id="empty" class="empty-state"><div class="artwork"><div class="art-paper paper-back"><span>ideas in bloom</span><div class="orb small-orb"></div></div><div class="art-paper paper-main"><div class="sky-orb"></div><div class="arch arch-one"></div><div class="arch arch-two"></div><div class="orb"></div><span class="art-caption">A LITTLE WONDER, EVERY DAY.</span></div><div class="floating-label">✦ &nbsp; 你的下一张好图，从这里开始</div></div><h3>把脑海中的画面，<br>变成眼前的喜欢。</h3><p>写下灵感，或者放入几张参考图。<br>剩下的，交给想象力。</p><div class="idea-chips"><button data-idea="真实摄影，一只可爱的柯基认真写贺卡，贺卡写着 To my one and only，温暖自然。">🐾 可爱日常</button><button data-idea="一张极简建筑摄影，阳光穿过奶油色拱门，宁静，干净，高级。">☀ 光影建筑</button><button data-idea="一张充满想象力的梦境摄影，漂浮在云海上的小花园，柔和色彩。">☁ 自由想象</button></div></div>
+    <div id="gallery" class="gallery"></div>
+    <footer class="gallery-footer"><span>✦ 拾光 · 每一个想法，都值得被看见</span><span>历史仅保存在此浏览器</span></footer>
+  </section>
+</main>
+<dialog id="settings"><form id="settingsForm"><div class="dialog-header"><div><span class="eyebrow">CONNECTION</span><h2>连接你的想象力</h2></div><button type="button" class="icon-button" data-close="settings" aria-label="关闭设置">×</button></div><label>API 地址<input id="baseUrl" type="url" required value="https://www.kuaiaiapi.com"></label><label>API Key<input id="apiKey" type="password" autocomplete="off" spellcheck="false" placeholder="输入你的 API Key"></label><p class="helper">密钥仅在当前页面内存中使用，不写入历史或 GitHub，刷新后需重新填写。</p><label>模型<input id="model" value="gpt-image-2.5" required></label><details><summary>高级接口参数</summary><div class="form-grid"><label>文生图路径<input id="generationPath" value="/v1/images/generations" required></label><label>图生图路径<input id="editPath" value="/v1/images/edits" required></label><label>轮询路径<input id="taskPath" value="/v1/images/tasks/{id}" required></label><label>多图字段<input id="imageField" value="image[]" required></label><label>请求超时（秒）<input id="timeout" type="number" min="10" max="1800" value="240" required></label><label>轮询间隔（秒）<input id="pollSeconds" type="number" min="1" max="60" value="4" required></label></div><label>额外参数 JSON<textarea id="extra" rows="3" spellcheck="false" placeholder='{"background":"auto"}'>{}</textarea></label><p class="helper">支持服务商额外字段；核心模型、提示词、尺寸和图片由创作面板设置。</p></details><div class="dialog-footer"><span id="connectionResult" class="helper"></span><button type="button" id="testConnection" class="button secondary">检查跨域连接</button><button class="button primary" type="submit">保存设置</button></div></form></dialog>
+<dialog id="preview"><div class="preview-header"><span id="previewTitle"></span><button type="button" class="icon-button" data-close="preview" aria-label="关闭预览">×</button></div><img id="previewImage" alt="生成结果大图"><div class="preview-actions"><button id="prevImage" class="button secondary" aria-label="上一张">←</button><button id="previewDownload" class="button secondary">下载原图</button><button id="previewCopy" class="button secondary">复制图片</button><button id="previewShare" class="button secondary">分享</button><button id="previewUse" class="button primary">用这张继续创作</button><button id="nextImage" class="button secondary" aria-label="下一张">→</button></div></dialog>
+<div id="toasts" class="toasts" aria-live="polite"></div><script type="module" src="app.js"></script>
+</body></html>
