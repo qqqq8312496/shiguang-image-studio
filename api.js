@@ -1,10 +1,11 @@
-export const defaults = {baseUrl:'https://www.kuaiaiapi.com',model:'gpt-image-2.5',generationPath:'/v1/images/generations',editPath:'/v1/images/edits',taskPath:'/v1/images/tasks/{id}',requestMode:'auto',asyncGenerationPath:'/v1/images/generations/async',imageField:'image[]',timeout:240,pollSeconds:4,extra:{}};
+export const defaults = {baseUrl:'https://www.kuaiaiapi.com',model:'gpt-image-2.5',generationPath:'/v1/images/generations',editPath:'/v1/images/edits',taskPath:'/v1/images/tasks/{id}',requestMode:'auto',asyncGenerationPath:'/v1/images/generations/async',asyncEditPath:'/v1/images/edits/async',imageField:'image[]',timeout:240,pollSeconds:4,extra:{}};
 export function submissionPath(config,hasImages){
-  if(hasImages)return config.editPath;
   const mode=config.requestMode||'auto';
   const provider=new URL(config.baseUrl).hostname==='www.kuaiaiapi.com';
-  return mode==='async'||(mode==='auto'&&provider&&config.generationPath==='/v1/images/generations')
-    ?config.asyncGenerationPath||defaults.asyncGenerationPath:config.generationPath;
+  const directPath=hasImages?config.editPath:config.generationPath;
+  const defaultPath=hasImages?defaults.editPath:defaults.generationPath;
+  const asyncPath=hasImages?config.asyncEditPath||defaults.asyncEditPath:config.asyncGenerationPath||defaults.asyncGenerationPath;
+  return mode==='async'||(mode==='auto'&&provider&&directPath===defaultPath)?asyncPath:directPath;
 }
 export function endpoint(config,path) {
   const base = new URL(config.baseUrl);

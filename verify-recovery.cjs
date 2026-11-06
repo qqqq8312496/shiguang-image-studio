@@ -25,7 +25,7 @@ const assert=require('node:assert/strict');
   if(failDownload)return route.abort();
   return route.fulfill({status:200,headers:{'Access-Control-Allow-Origin':'*','Content-Type':'image/png'},body:fixture});
  });
- await page.locator('#settingsOpen').click();await page.locator('#baseUrl').fill('https://mock.invalid');await page.locator('#apiKey').fill('test-recovery-only');await page.locator('#rememberKey').check();await page.locator('summary').click();await page.locator('#pollSeconds').fill('1');await page.locator('#settingsForm button[type=submit]').click();
+ await page.locator('#settingsOpen').click();await page.locator('#baseUrl').fill('https://mock.invalid');await page.locator('#apiKey').fill('test-recovery-only');await page.locator('#rememberKey').check();await page.locator('#settings summary').click();await page.locator('#pollSeconds').fill('1');await page.locator('#settingsForm button[type=submit]').click();
  await page.locator('#prompt').fill('recover result');await page.locator('#generate').click();
  await page.getByRole('button',{name:'重新获取图片'}).waitFor();assert.equal(posts,1);assert.equal(await page.getByRole('link',{name:'打开原图链接'}).count(),1);
  await page.reload();await page.getByRole('button',{name:'重新获取图片'}).waitFor();failDownload=false;

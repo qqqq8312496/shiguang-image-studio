@@ -53,10 +53,10 @@ const assert=require('node:assert/strict');
  // Explicit server failures remain distinguishable from transport uncertainty.
  mode='failed';await p.locator('#generate').click();await p.waitForFunction(()=>document.querySelector('.pending-content')?.textContent.includes('test provider task failure'));assert.ok((await p.locator('.pending-content').innerText()).includes('生成失败'));assert.equal(posts.length,3);
  mode='denied';await p.locator('#generate').click();await p.waitForFunction(()=>document.querySelector('.pending-content')?.textContent.includes('invalid test credential'));assert.ok((await p.locator('.pending-content').innerText()).includes('生成失败'));assert.equal(posts.length,4);
- const paths=await p.evaluate(async()=>{const {submissionPath,defaults}=await import('./api.js?v=20261106-async');return [submissionPath(defaults,false),submissionPath(defaults,true),submissionPath({...defaults,baseUrl:'https://other.invalid'},false),submissionPath({...defaults,requestMode:'direct'},false)];});
- assert.deepEqual(paths,['/v1/images/generations/async','/v1/images/edits','/v1/images/generations','/v1/images/generations']);
+ const paths=await p.evaluate(async()=>{const {submissionPath,defaults}=await import('./api.js?v=20261106-edit-prompts');return [submissionPath(defaults,false),submissionPath(defaults,true),submissionPath({...defaults,baseUrl:'https://other.invalid'},false),submissionPath({...defaults,requestMode:'direct'},false)];});
+ assert.deepEqual(paths,['/v1/images/generations/async','/v1/images/edits/async','/v1/images/generations','/v1/images/generations']);
  assert.ok(await p.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));assert.deepEqual(errors,[]);
  await p.screenshot({path:'test-results/async-mobile.png',fullPage:true});
- console.log('PASS: old-settings migration, task ID persisted immediately, refresh GET-only auto resume, transient GET retries, queued images never auto-submit, lost POST never falls back/repeats, manual provider-result recovery, server vs transport failure states, edit/custom-provider paths unchanged.');
+ console.log('PASS: old-settings migration, task ID persisted immediately, refresh GET-only auto resume, transient GET retries, queued images never auto-submit, lost POST never falls back/repeats, manual provider-result recovery, server vs transport failure states, async edit routing, custom-provider paths unchanged.');
  await b.close();
 })().catch(e=>{console.error(e);process.exit(1)});
