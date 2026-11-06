@@ -1,4 +1,11 @@
-export const defaults = {baseUrl:'https://www.kuaiaiapi.com',model:'gpt-image-2.5',generationPath:'/v1/images/generations',editPath:'/v1/images/edits',taskPath:'/v1/images/tasks/{id}',imageField:'image[]',timeout:240,pollSeconds:4,extra:{}};
+export const defaults = {baseUrl:'https://www.kuaiaiapi.com',model:'gpt-image-2.5',generationPath:'/v1/images/generations',editPath:'/v1/images/edits',taskPath:'/v1/images/tasks/{id}',requestMode:'auto',asyncGenerationPath:'/v1/images/generations/async',imageField:'image[]',timeout:240,pollSeconds:4,extra:{}};
+export function submissionPath(config,hasImages){
+  if(hasImages)return config.editPath;
+  const mode=config.requestMode||'auto';
+  const provider=new URL(config.baseUrl).hostname==='www.kuaiaiapi.com';
+  return mode==='async'||(mode==='auto'&&provider&&config.generationPath==='/v1/images/generations')
+    ?config.asyncGenerationPath||defaults.asyncGenerationPath:config.generationPath;
+}
 export function endpoint(config,path) {
   const base = new URL(config.baseUrl);
   if (base.protocol !== 'https:' && !['localhost','127.0.0.1'].includes(base.hostname)) throw new Error('API 地址需要使用 HTTPS。');
@@ -26,27 +33,35 @@ function wait(ms,signal) {return new Promise((resolve,reject)=>{
   signal.addEventListener('abort',cancel,{once:true});
 });}
 export async function timedFetch(url,options,seconds,signal) {
+  const started=Date.now();let phase='connection',httpStatus=null,requestId=null;
   const ctrl = new AbortController();
   const stop = () => ctrl.abort(signal?.reason);
   if (signal?.aborted) stop(); else signal?.addEventListener('abort',stop,{once:true});
   const timer=setTimeout(()=>ctrl.abort(new DOMException('请求超时','TimeoutError')),seconds*1000);
   try {
     const response=await fetch(url,{...options,credentials:'omit',referrerPolicy:'no-referrer',signal:ctrl.signal});
+    phase='response-body';httpStatus=response.status;
+    requestId=response.headers.get('x-request-id')||response.headers.get('request-id');
     // Read the body before clearing the timeout, including long streamed responses.
     const buffer=await response.arrayBuffer();
     return new Response(buffer,{status:response.status,statusText:response.statusText,headers:response.headers});
   } catch(e) {
     if (signal?.aborted) throw new DOMException('已停止','AbortError');
-    if (ctrl.signal.aborted) throw new Error('请求超时。服务端可能仍在生成；请先在服务商后台确认，再重试。');
-    throw new Error('无法读取接口响应：请检查网络、API 地址及服务商的跨域设置。');
+    const error=new Error(ctrl.signal.aborted?'等待接口响应超时。':'浏览器未能收到完整接口响应，可能是连接中断或响应被浏览器拦截。');
+    error.outcome='unknown';
+    error.diagnostic={phase,httpStatus,requestId,elapsedMs:Date.now()-started,online:typeof navigator!=='undefined'?navigator.onLine:null,hidden:typeof document!=='undefined'?document.hidden:null};
+    throw error;
   } finally {clearTimeout(timer);signal?.removeEventListener('abort',stop);}
 }
 async function readPayload(response) {
   const raw=await response.text(); let data;
-  try {data=JSON.parse(raw);} catch {throw new Error(`HTTP ${response.status}：接口未返回 JSON。`);}
+  try {data=JSON.parse(raw);} catch {const error=new Error(`HTTP ${response.status}：接口未返回完整 JSON。`);error.httpStatus=response.status;error.outcome='unknown';throw error;}
   if (!response.ok || data.error) {
     const msg=typeof data.error==='string'?data.error:(data.error?.message || data.message || response.statusText);
-    throw new Error(`HTTP ${response.status}：${String(msg).slice(0,400)}`);
+    const error=new Error(`HTTP ${response.status}：${String(msg).slice(0,400)}`);
+    error.httpStatus=response.status;
+    error.outcome=[408,409,429].includes(response.status)||response.status>=500?'unknown':'failed';
+    throw error;
   }
   return data;
 }
@@ -61,24 +76,31 @@ export async function generateImage({config,key,prompt,refs,size,quality,signal,
   let payload={}, ref=resume?.ref||null;
   if(!resume){
     onStatus('提交并等待生成结果');
-    try{payload=await readPayload(await timedFetch(endpoint(config,refs.length?config.editPath:config.generationPath),{method:'POST',headers,body},config.timeout,signal));}
+    try{payload=await readPayload(await timedFetch(endpoint(config,submissionPath(config,refs.length>0)),{method:'POST',headers,body},config.timeout,signal));}
     catch(error){
-      error.message='提交/接收生成结果阶段：'+error.message+' 本次结果可能已在后台生成，请先查看服务商后台；不要直接重复生成。';
+      error.message='提交/接收生成结果阶段：'+error.message+(error.outcome==='failed'?' 服务商返回了错误。':' 网页未收到结果，后台可能已完成。请先查后台，或导入后台结果；重新生成可能再次扣费。');
       error.stage='submission';throw error;
     }
     ref=imageRef(payload);
   }
   if(!ref){
     const taskId=resume?.taskId||findValue(payload,['task_id','id']);
-    if(!taskId)throw new Error('返回中没有图片或任务 ID。请先查看服务商后台确认结果。');
+    if(!taskId){const error=new Error('接口未返回图片或任务 ID。请先查看服务商后台确认结果。');error.stage='submission';error.outcome='unknown';throw error;}
     await onCheckpoint({taskId});
     const deadline=Date.now()+15*60*1000;
+    let connectionFailures=0;
     while(Date.now()<deadline){
       onStatus('服务端生成中');await wait(config.pollSeconds*1000,signal);
       try{payload=await readPayload(await timedFetch(endpoint(config,config.taskPath.replace('{id}',encodeURIComponent(taskId))),{headers:{Authorization:`Bearer ${key}`}},config.timeout,signal));}
-      catch(error){error.message='查询已有任务阶段：'+error.message+' 可重新获取结果，无需重新生成。';throw error;}
+      catch(error){
+        if(signal.aborted)throw error;
+        // Only retry reads of an existing task. A failed POST is never resubmitted.
+        if((!error.httpStatus||[408,429].includes(error.httpStatus)||error.httpStatus>=500)&&++connectionFailures<=3){onStatus('查询连接中断，正在重新查询已有任务');continue;}
+        error.message='查询已有任务阶段：'+error.message+' 任务 ID 已保存，可继续获取，无需重新生成。';error.stage='poll';throw error;
+      }
+      connectionFailures=0;
       const status=(findValue(payload,['status','state'])||'').toUpperCase();
-      if(['FAILURE','FAILED','ERROR','CANCELED','CANCELLED'].includes(status))throw new Error(findValue(payload,['message','error'])||'服务端任务失败。');
+      if(['FAILURE','FAILED','ERROR','CANCELED','CANCELLED'].includes(status)){const error=new Error(findValue(payload,['fail_reason','message','error'])||'服务端任务失败。');error.outcome='failed';error.stage='task';throw error;}
       ref=imageRef(payload);if(ref)break;
       if(['SUCCESS','SUCCEEDED','COMPLETED','COMPLETE','DONE'].includes(status))throw new Error('任务已结束，但没有返回图片。');
     }

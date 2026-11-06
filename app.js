@@ -1,8 +1,9 @@
-import {defaults,endpoint,generateImage} from './api.js?v=20260921-recovery';
+import {defaults,endpoint,generateImage} from './api.js?v=20261106-async';
 const $=id=>document.getElementById(id);
 let config={...defaults}, key='', refs=[], batches=[], selected='', active=null, submitting=false, directory=null, previewItem=null, db=null;
 const urls=new Map();
-const states={queued:'等待生成',running:'正在生成',done:'已完成',error:'生成失败',stopped:'已停止'};
+let interruptedToResume=[], recoveryTarget=null;
+const states={queued:'等待生成',running:'正在生成',done:'已完成',error:'生成失败',unknown:'结果待确认',recoverable:'结果待获取',stopped:'已停止'};
 let restoringDraft=true, draftDBPromise=null, draftWrites=0, draftTextError=false, draftRefsError=false;
 const draftFields=['prompt','size','quality','count','concurrency'];
 function draftStatus(){
@@ -78,7 +79,7 @@ function element(tag,cls,text){const el=document.createElement(tag);if(cls)el.cl
 function urlFor(blob){if(!urls.has(blob))urls.set(blob,URL.createObjectURL(blob));return urls.get(blob);}
 let rememberKey=false;
 function readConfig(){try{config={...defaults,...JSON.parse(localStorage.getItem('shiguang.config')||'{}')};}catch{config={...defaults};}for(const k of Object.keys(defaults)){if($(k))$(k).value=k==='extra'?JSON.stringify(config[k],null,2):config[k];}$('modelLabel').textContent=config.model;try{key=localStorage.getItem('shiguang.apiKey')||'';rememberKey=Boolean(key);}catch{}$('rememberKey').checked=rememberKey;$('settingsOpen').classList.toggle('connected',Boolean(key));}
-function settingsConfig(){const result={};for(const k of Object.keys(defaults))result[k]=$(k).value.trim();result.timeout=Number(result.timeout);result.pollSeconds=Number(result.pollSeconds);result.extra=JSON.parse(result.extra||'{}');if(!result.extra||Array.isArray(result.extra)||typeof result.extra!=='object')throw new Error('额外参数必须是 JSON 对象。');for(const p of [result.generationPath,result.editPath,result.taskPath])endpoint(result,p);return result;}
+function settingsConfig(){const result={};for(const k of Object.keys(defaults))result[k]=$(k).value.trim();result.timeout=Number(result.timeout);result.pollSeconds=Number(result.pollSeconds);result.extra=JSON.parse(result.extra||'{}');if(!result.extra||Array.isArray(result.extra)||typeof result.extra!=='object')throw new Error('额外参数必须是 JSON 对象。');for(const p of [result.generationPath,result.editPath,result.taskPath,result.asyncGenerationPath])endpoint(result,p);return result;}
 function openSettings(){$('apiKey').value=key;$('rememberKey').checked=rememberKey;$('settings').showModal();}
 $('settingsOpen').onclick=openSettings;
 document.querySelectorAll('[data-close]').forEach(b=>b.onclick=()=>$(b.dataset.close).close());
@@ -96,13 +97,40 @@ $('settingsForm').onsubmit=e=>{
     $('rememberKey').checked=rememberKey;
     $('modelLabel').textContent=config.model;
     $('settingsOpen').classList.toggle('connected',Boolean(key));
-    $('settings').close();toast(rememberKey?'设置已保存，刷新后会记住 API Key':'设置已保存，API Key 仅本次使用');
+    $('settings').close();resumeInterruptedTasks();toast(rememberKey?'设置已保存，刷新后会记住 API Key':'设置已保存，API Key 仅本次使用');
   }catch(e){toast(['QuotaExceededError','SecurityError'].includes(e.name)?'浏览器不允许保存设置，请检查存储权限或退出无痕模式。':e.message);}
 };
 $('testConnection').onclick=async()=>{try{const c=settingsConfig();$('connectionResult').textContent='正在检查浏览器跨域访问…';const r=await fetch(endpoint(c,c.generationPath),{method:'POST',credentials:'omit',headers:{Authorization:'Bearer cors-check-invalid-key','Content-Type':'application/json'},body:JSON.stringify({model:c.model,prompt:'connection-check'}),signal:AbortSignal.timeout(15000)});$('connectionResult').textContent=r.status===401||r.status===403?`跨域可访问（HTTP ${r.status}）。未使用真实密钥，不验证余额或模型。`:`接口响应 HTTP ${r.status}。此检查不验证模型和余额。`;}catch(e){$('connectionResult').textContent='浏览器无法读取响应，请检查网络或服务商跨域配置。';}};
 function openDB(){return new Promise((resolve,reject)=>{const req=indexedDB.open('shiguang-studio',1);req.onupgradeneeded=()=>req.result.createObjectStore('batches',{keyPath:'id'});req.onsuccess=()=>resolve(req.result);req.onerror=()=>reject(req.error);});}
 async function storeBatch(batch){if(!db)return;try{await new Promise((resolve,reject)=>{const tx=db.transaction('batches','readwrite');tx.objectStore('batches').put(batch);tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error);});}catch{toast('浏览器存储空间不足，请立即下载图片；当前页面仍可使用。');}}
-async function loadBatches(){db=await openDB();batches=await new Promise((resolve,reject)=>{const req=db.transaction('batches').objectStore('batches').getAll();req.onsuccess=()=>resolve(req.result);req.onerror=()=>reject(req.error);});batches.sort((a,b)=>b.created-a.created);for(const batch of batches){for(const item of batch.items)if(['queued','running'].includes(item.status)){item.status='stopped';item.error='页面已关闭或刷新；服务端可能仍在生成，确认后可手动重试。';}}}
+async function loadBatches(){
+  db=await openDB();
+  batches=await new Promise((resolve,reject)=>{const req=db.transaction('batches').objectStore('batches').getAll();req.onsuccess=()=>resolve(req.result);req.onerror=()=>reject(req.error);});
+  batches.sort((a,b)=>b.created-a.created);
+  for(const batch of batches){
+    for(const item of batch.items){
+      if(['queued','running'].includes(item.status)){
+        const wasRunning=item.status==='running';
+        item.status=item.recovery?'recoverable':wasRunning?'unknown':'stopped';
+        item.stage=wasRunning&&!item.recovery?'submission':item.stage;
+        item.error=item.recovery?'上次等待已中断，已有任务信息已保存，可以继续获取。':wasRunning?'上次连接已中断，网页未收到结果。请先查服务商后台，避免重复生成。':'上次未完成提交；确认后可手动生成。';
+        if(item.recovery&&Date.now()-batch.created<86400000)interruptedToResume.push({batch,id:item.id});
+      }else if(item.status==='error'&&item.stage==='submission'){
+        // Old versions stored every transport failure as "failed".
+        item.status='unknown';
+      }
+    }
+  }
+}
+async function resumeInterruptedTasks(){
+  if(!key||active||submitting)return;
+  const pending=interruptedToResume;interruptedToResume=[];
+  for(const batch of [...new Set(pending.map(x=>x.batch))]){
+    if(active||submitting){interruptedToResume.push(...pending.filter(x=>x.batch===batch));continue;}
+    const ids=pending.filter(x=>x.batch===batch).map(x=>x.id).filter(id=>batch.items.find(i=>i.id===id)?.recovery);
+    if(ids.length)await runBatch(batch,ids);
+  }
+}
 function renderRefs(){$('references').replaceChildren();refs.forEach((ref,i)=>{const card=element('div','reference');const img=element('img');img.src=urlFor(ref.blob);img.alt=`参考图 ${i+1}：${ref.name}`;img.onclick=()=>showPreview({blob:ref.blob,name:ref.name});card.append(img,element('span','index',i+1));const del=element('button','', '×');del.type='button';del.title='删除参考图片';del.onclick=()=>{refs.splice(i,1);renderRefs();};const role=element('select');role.setAttribute('aria-label',`参考图 ${i+1} 的角色`);for(const [v,t]of [['free','自由参考'],['subject','主体外观'],['background','背景'],['style','风格']]){const opt=element('option','',t);opt.value=v;role.append(opt);}role.value=ref.role;role.onchange=()=>{if(role.value==='background')for(const r of refs)if(r!==ref&&r.role==='background')r.role='free';ref.role=role.value;renderRefs();};card.append(del,role);$('references').append(card);});$('mode').textContent=refs.length?'图生图 · '+refs.length+' 张':'文生图';$('refHint').hidden=!refs.length;saveDraftReferences();}
 async function addFiles(files){for(const f of files){if(!['image/png','image/jpeg','image/webp'].includes(f.type)){toast('支持 PNG、JPG 和 WebP 图片');continue;}if(refs.length>=16){toast('本页面每次最多添加 16 张参考图');break;}if(f.size>30*1024*1024){toast('单张参考图片请控制在 30 MB 内');continue;}try{const bmp=await createImageBitmap(f);bmp.close();refs.push({name:f.name||'pasted.png',blob:f,role:'free'});}catch{toast('这张图片无法读取');}}renderRefs();}
 $('fileInput').onchange=async e=>{await addFiles([...e.target.files]);e.target.value='';};
@@ -122,14 +150,41 @@ document.querySelectorAll('[data-idea]').forEach(b=>b.onclick=()=>{$('prompt').v
 document.addEventListener('keydown',e=>{if((e.ctrlKey||e.metaKey)&&e.key==='Enter'&&!$('settings').open&&!active){$('createForm').requestSubmit();}if($('preview').open){if(e.key==='ArrowLeft')movePreview(-1);if(e.key==='ArrowRight')movePreview(1);}});
 function effectivePrompt(prompt,inputs){const notes=[];inputs.forEach((ref,i)=>{if(ref.role==='background')notes.push(`第 ${i+1} 张为唯一背景参考，保持房间、家具布局、透视和光线；其他图片的背景不要混入。`);if(ref.role==='subject')notes.push(`第 ${i+1} 张仅用于主体外观与身份细节参考。`);if(ref.role==='style')notes.push(`第 ${i+1} 张仅用于风格参考。`);});return prompt+(notes.length?'\n\n参考图片分工：\n'+notes.join('\n'):'');}
 $('createForm').onsubmit=async e=>{e.preventDefault();if(active||submitting)return;if(!key){toast('先填写 API Key，就可以开始创作');openSettings();return;}const prompt=$('prompt').value.trim();if(!prompt)return;submitting=true;$('generate').disabled=true;const count=Number($('count').value);const batch={id:crypto.randomUUID(),created:Date.now(),prompt,refs:refs.map(r=>({...r})),config:structuredClone(config),size:$('size').value.trim(),quality:$('quality').value,concurrency:Number($('concurrency').value),items:Array.from({length:count},(_,i)=>({id:crypto.randomUUID(),number:i+1,status:'queued'}))};batch.effectivePrompt=effectivePrompt(prompt,batch.refs);batches.unshift(batch);selected=batch.id;await storeBatch(batch);submitting=false;runBatch(batch);};
-async function runBatch(batch,onlyIds=null){if(active)return;const controller=new AbortController();active={batch,controller};const runKey=key;const queue=batch.items.filter(i=>onlyIds?onlyIds.includes(i.id):i.status==='queued');queue.forEach(i=>{i.status='queued';i.error='';});render();let cursor=0;const worker=async()=>{while(cursor<queue.length&&!controller.signal.aborted){const item=queue[cursor++];item.status='running';await storeBatch(batch);renderGallery();try{const result=await generateImage({config:batch.config,key:runKey,prompt:batch.effectivePrompt,refs:batch.refs,size:batch.size,quality:batch.quality,signal:controller.signal,resume:item.recovery||null,onCheckpoint:async checkpoint=>{item.recovery=checkpoint;await storeBatch(batch);},onStatus:s=>{item.label=s;renderGallery();}});Object.assign(item,result,{status:'done',name:`shiguang_${new Date(batch.created).toISOString().replace(/[:.]/g,'-')}_${String(item.number).padStart(2,'0')}.${result.blob.type==='image/jpeg'?'jpg':result.blob.type==='image/webp'?'webp':'png'}`});delete item.recovery;delete item.stage;if(directory)await saveToDirectory(item).catch(e=>toast(e.message));}catch(e){item.status=controller.signal.aborted?'stopped':'error';item.stage=e.stage||null;item.error=String(e.message).split(runKey).join('[hidden]');}await storeBatch(batch);renderGallery();}};await Promise.all(Array.from({length:Math.min(batch.concurrency,queue.length)},worker));for(const i of queue)if(i.status==='queued')i.status='stopped';active=null;await storeBatch(batch);render();const good=batch.items.filter(i=>i.status==='done').length;toast(`本组已完成 ${good}/${batch.items.length} 张`);}
+async function runBatch(batch,onlyIds=null){
+  if(active)return;
+  const controller=new AbortController();active={batch,controller};const runKey=key;
+  const queue=batch.items.filter(i=>onlyIds?onlyIds.includes(i.id):i.status==='queued');
+  queue.forEach(i=>{i.status='queued';i.error='';});render();let cursor=0;
+  const worker=async()=>{
+    while(cursor<queue.length&&!controller.signal.aborted){
+      const item=queue[cursor++];item.status='running';item.startedAt=Date.now();await storeBatch(batch);renderGallery();
+      try{
+        const result=await generateImage({config:batch.config,key:runKey,prompt:batch.effectivePrompt,refs:batch.refs,size:batch.size,quality:batch.quality,signal:controller.signal,resume:item.recovery||null,onCheckpoint:async checkpoint=>{item.recovery=checkpoint;await storeBatch(batch);},onStatus:s=>{item.label=s;renderGallery();}});
+        Object.assign(item,result,{status:'done',name:`shiguang_${new Date(batch.created).toISOString().replace(/[:.]/g,'-')}_${String(item.number).padStart(2,'0')}.${result.blob.type==='image/jpeg'?'jpg':result.blob.type==='image/webp'?'webp':'png'}`});
+        delete item.recovery;delete item.stage;delete item.diagnostic;
+        if(directory)await saveToDirectory(item).catch(e=>toast(e.message));
+      }catch(e){
+        if(e.outcome==='failed'&&e.stage==='task')delete item.recovery;
+        item.status=item.recovery?'recoverable':e.outcome==='failed'?'error':e.stage==='submission'||controller.signal.aborted?'unknown':'error';
+        item.stage=e.stage||'submission';item.diagnostic=e.diagnostic||null;
+        item.error=String(e.message).split(runKey).join('[hidden]');
+      }
+      await storeBatch(batch);renderGallery();
+    }
+  };
+  await Promise.all(Array.from({length:Math.min(batch.concurrency,queue.length)},worker));
+  for(const i of queue)if(i.status==='queued')i.status=i.recovery?'recoverable':'stopped';
+  active=null;await storeBatch(batch);render();
+  const good=batch.items.filter(i=>i.status==='done').length;
+  toast(`本组已收到 ${good}/${batch.items.length} 张；其余状态见图片卡片`);
+}
 $('stop').onclick=()=>{if(active){active.controller.abort();toast('已停止等待和后续提交；已提交任务可能仍在服务端生成并计费。');}};
 function currentBatch(){return batches.find(b=>b.id===selected);}
 function visibleItems(){return (selected?batches.filter(b=>b.id===selected):batches).flatMap(b=>b.items.map(i=>({batch:b,item:i})));}
 function render(){const previous=selected;$('batchSelect').replaceChildren();const all=element('option','','所有创作');all.value='';$('batchSelect').append(all);for(const b of batches){const opt=element('option','',`${new Date(b.created).toLocaleString('zh-CN',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'})} · ${b.prompt.slice(0,18)} · ${b.items.length} 张`);opt.value=b.id;$('batchSelect').append(opt);}$('batchSelect').value=previous;$('generate').disabled=Boolean(active||submitting);$('stop').hidden=!active;$('reuse').disabled=!currentBatch();$('total').textContent=batches.reduce((n,b)=>n+b.items.filter(i=>i.status==='done').length,0);renderGallery();}
-function renderGallery(){const entries=visibleItems();$('empty').hidden=Boolean(entries.length);$('gallery').replaceChildren();$('exportAll').disabled=!entries.some(e=>e.item.blob);for(const {batch,item}of entries){const card=element('article','image-card');const wrap=element('div','image-wrap');wrap.append(element('span','number',String(item.number).padStart(2,'0')));if(item.blob){const img=element('img');img.src=urlFor(item.blob);img.alt=`生成结果 ${item.number}`;img.loading='lazy';img.draggable=true;img.onclick=()=>showPreview(item);img.ondragstart=e=>{e.dataTransfer.setData('DownloadURL',`${item.blob.type}:${item.name}:${urlFor(item.blob)}`);e.dataTransfer.setData('text/uri-list',urlFor(item.blob));};wrap.append(img);}else{const content=element('div','pending-content');if(item.status==='running')content.append(element('div','spinner'));content.append(element('div','',item.label&&item.status==='running'?item.label:states[item.status]));if(item.error)content.append(element('p','helper',item.error));wrap.append(content);}const bottom=element('div','card-bottom');bottom.append(element('span','',item.blob?`${item.width} × ${item.height}`:batch.config.model));const buttons=element('div');if(item.blob){for(const [text,action]of [['放大',()=>showPreview(item)],['复制',()=>copyImage(item)],['下载',()=>download(item)]]){const b=element('button','',text);b.onclick=action;buttons.append(b);}}else if(['error','stopped'].includes(item.status)){const b=element('button','',item.recovery?'重新获取图片':item.stage==='submission'?'重新生成（可能扣费）':'重试此张');b.disabled=Boolean(active);b.onclick=()=>{if(!key){openSettings();return;}if(!item.recovery&&item.stage==='submission'&&!confirm('这次将重新提交生图，可能再次扣费。请先确认服务商后台是否已有结果。仍要重新生成吗？'))return;runBatch(batch,[item.id]);};buttons.append(b);if(item.recovery?.ref){try{const direct=new URL(item.recovery.ref,batch.config.baseUrl);if(['https:','http:'].includes(direct.protocol)){const a=element('a','text-button','打开原图链接');a.href=direct.href;a.target='_blank';a.rel='noopener noreferrer';buttons.append(a);}}catch{}}}bottom.append(buttons);card.append(wrap,bottom);$('gallery').append(card);}}
+function renderGallery(){const entries=visibleItems();$('empty').hidden=Boolean(entries.length);$('gallery').replaceChildren();$('exportAll').disabled=!entries.some(e=>e.item.blob);for(const {batch,item}of entries){const card=element('article','image-card');const wrap=element('div','image-wrap');wrap.append(element('span','number',String(item.number).padStart(2,'0')));if(item.blob){const img=element('img');img.src=urlFor(item.blob);img.alt=`生成结果 ${item.number}`;img.loading='lazy';img.draggable=true;img.onclick=()=>showPreview(item);img.ondragstart=e=>{e.dataTransfer.setData('DownloadURL',`${item.blob.type}:${item.name}:${urlFor(item.blob)}`);e.dataTransfer.setData('text/uri-list',urlFor(item.blob));};wrap.append(img);}else{const content=element('div','pending-content');if(item.status==='running')content.append(element('div','spinner'));content.append(element('div','',item.label&&item.status==='running'?item.label:states[item.status]));if(item.error)content.append(element('p','helper',item.error));if(item.diagnostic){const details=element('details','diagnostic');details.append(element('summary','','连接详情'));details.append(element('p','helper',`等待 ${Math.round(item.diagnostic.elapsedMs/1000)} 秒；${item.diagnostic.phase==='response-body'?'已收响应头，响应体中断':'未收到响应头'}；浏览器${item.diagnostic.online?'报告在线':'报告离线'}${item.diagnostic.hidden?'；页面在后台':''}${item.diagnostic.httpStatus?'；HTTP '+item.diagnostic.httpStatus:''}`));content.append(details);}wrap.append(content);}const bottom=element('div','card-bottom');bottom.append(element('span','',item.blob?`${item.width} × ${item.height}`:batch.config.model));const buttons=element('div');if(item.blob){for(const [text,action]of [['放大',()=>showPreview(item)],['复制',()=>copyImage(item)],['下载',()=>download(item)]]){const b=element('button','',text);b.onclick=action;buttons.append(b);}}else if(['error','stopped','unknown','recoverable'].includes(item.status)){const b=element('button','',item.recovery?'重新获取图片':item.stage==='submission'?'重新生成（可能扣费）':'重试此张');b.disabled=Boolean(active);b.onclick=()=>{if(!key){openSettings();return;}if(!item.recovery&&item.stage==='submission'&&!confirm('这次将重新提交生图，可能再次扣费。请先确认服务商后台是否已有结果。仍要重新生成吗？'))return;runBatch(batch,[item.id]);};buttons.append(b);const recover=element('button','','恢复后台结果');recover.disabled=Boolean(active);recover.onclick=()=>{recoveryTarget={batch,item};$('recoveryInput').value='';$('recoverResult').showModal();};buttons.append(recover);if(item.recovery?.ref){try{const direct=new URL(item.recovery.ref,batch.config.baseUrl);if(['https:','http:'].includes(direct.protocol)){const a=element('a','text-button','打开原图链接');a.href=direct.href;a.target='_blank';a.rel='noopener noreferrer';buttons.append(a);}}catch{}}}bottom.append(buttons);card.append(wrap,bottom);$('gallery').append(card);}}
 $('batchSelect').onchange=e=>{selected=e.target.value;render();};
-$('reuse').onclick=()=>{const b=currentBatch();if(!b)return;$('prompt').value=b.prompt;refs=b.refs.map(r=>({...r}));$('size').value=b.size;$('quality').value=b.quality;$('count').value=b.items.length;$('concurrency').value=b.concurrency;config=structuredClone(b.config);for(const k of Object.keys(defaults))$(k).value=k==='extra'?JSON.stringify(config[k],null,2):config[k];$('modelLabel').textContent=config.model;updatePrompt();renderRefs();markRatio();$('count').oninput();window.scrollTo({top:0,behavior:'smooth'});toast('已复用本组提示词、参考图及参数');};
+$('reuse').onclick=()=>{const b=currentBatch();if(!b)return;$('prompt').value=b.prompt;refs=b.refs.map(r=>({...r}));$('size').value=b.size;$('quality').value=b.quality;$('count').value=b.items.length;$('concurrency').value=b.concurrency;config={...defaults,...structuredClone(b.config)};for(const k of Object.keys(defaults))$(k).value=k==='extra'?JSON.stringify(config[k],null,2):config[k];$('modelLabel').textContent=config.model;updatePrompt();renderRefs();markRatio();$('count').oninput();window.scrollTo({top:0,behavior:'smooth'});toast('已复用本组提示词、参考图及参数');};
 function showPreview(item){previewItem=item;$('previewImage').src=urlFor(item.blob);$('previewTitle').textContent=item.name||`生成结果 ${item.number}`;if(!$('preview').open)$('preview').showModal();}
 function movePreview(direction){const list=visibleItems().map(e=>e.item).filter(i=>i.blob);if(!list.length)return;const idx=list.indexOf(previewItem);showPreview(list[(idx+direction+list.length)%list.length]);}
 $('prevImage').onclick=()=>movePreview(-1);$('nextImage').onclick=()=>movePreview(1);
@@ -146,4 +201,21 @@ window.addEventListener('beforeunload',e=>{if(active){e.preventDefault();e.retur
 readConfig();
 const historyReady=loadBatches().catch(()=>toast('当前浏览器无法保存历史，建议下载生成结果。'));
 await restoreDraft();
-await historyReady;render();
+await historyReady;render();resumeInterruptedTasks();
+
+$('recoverForm').onsubmit=async e=>{
+  e.preventDefault();if(!recoveryTarget||active)return;
+  if(!key){$('recoverResult').close();openSettings();return;}
+  const input=$('recoveryInput').value.trim();let recovery;
+  try{
+    if(/^https?:/i.test(input)){
+      const url=new URL(input);if(url.protocol!=='https:'||url.username||url.password)throw new Error('请使用不含账号密码的 HTTPS 原图网址。');
+      recovery={ref:url.href};
+    }else{
+      if(!/^[A-Za-z0-9_-]{5,200}$/.test(input))throw new Error('请输入服务商提供的任务 ID 或完整 HTTPS 图片网址。');
+      recovery={taskId:input};
+    }
+    const {batch,item}=recoveryTarget;item.recovery=recovery;item.status='recoverable';await storeBatch(batch);
+    $('recoverResult').close();await runBatch(batch,[item.id]);
+  }catch(error){toast(error.message);}
+};
